@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicetype"
+version = "1.0.0"
+description = "VoiceType - 免费本地语音助手，支持语音整理、翻译、AI问答"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "pyaudio>=0.2.14",
+    "pynput>=1.7.6",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PyQt6>=6.6.0",
+]
+all = [
+    "voicetype[gui]",
+]
+
+[project.scripts]
+voicetype = "voicetype.cli.app:main"
+vt = "voicetype.cli.app:main"
+
+[tool.setuptools.packages.find]
+include = ["voicetype*"]
