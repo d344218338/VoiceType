@@ -1,4 +1,5 @@
 """核心引擎 - 串联录音、识别、LLM处理的完整流程"""
+import re
 import time
 import threading
 import pyperclip
@@ -11,18 +12,38 @@ from voicetype.core.llm import OllamaLLM
 
 
 class VoiceMode(Enum):
-    TRANSCRIBE = "transcribe"   # 语音整理：说话→整理成书面文字→自动输入
-    TRANSLATE = "translate"     # 语音翻译：说话→翻译→自动输入
-    REWRITE = "rewrite"         # AI改写：选中文字→说指令→AI改写并替换
+    TRANSCRIBE = "transcribe"
+    TRANSLATE = "translate"
+    REWRITE = "rewrite"
 
 
-# pyautogui 安全设置
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.05
 
 
+def _quick_punctuate(text: str) -> str:
+    """对短文本做简单标点修正，不走 LLM"""
+    text = text.strip()
+    if not text:
+        return text
+    # 去掉常见语气词
+    for filler in ["嗯", "啊", "那个", "就是说", "然后那个"]:
+        text = text.replace(filler, "")
+    text = text.strip()
+    # 如果末尾没标点，加句号
+    if text and text[-1] not in "。！？!?.，,、；;：:…":
+        if any(c in text for c in "吗呢吧啊"):
+            text += "？"
+        else:
+            text += "。"
+    return text
+
+
 class VoiceTypeEngine:
     """VoiceType 核心引擎"""
+
+    # 短文本阈值：低于此字数的 TRANSCRIBE 直接加标点，不走 LLM
+    SHORT_TEXT_THRESHOLD = 25
 
     def __init__(self, config: dict = None):
         self.config = config or load_config()
@@ -38,18 +59,15 @@ class VoiceTypeEngine:
         )
         self._on_status = None
         self._on_result = None
-        # 任务取消机制
         self._task_id = 0
         self._task_lock = threading.Lock()
 
     def new_task_id(self) -> int:
-        """生成新任务ID，旧任务自动失效"""
         with self._task_lock:
             self._task_id += 1
             return self._task_id
 
     def is_task_valid(self, task_id: int) -> bool:
-        """检查任务是否仍然有效（没被新任务取代）"""
         return task_id == self._task_id
 
     def set_callbacks(self, on_status=None, on_result=None):
@@ -64,13 +82,22 @@ class VoiceTypeEngine:
         self._status("正在检查 Ollama...")
         if not self.llm.ensure_ready():
             return False
+        # 预热模型 —— 发一个极短请求让模型加载到显存
+        self._status("正在预热 AI 模型...")
+        try:
+            self.llm.chat(
+                [{"role": "user", "content": "hi"}],
+                temperature=0, max_tokens=1
+            )
+        except Exception:
+            pass
         self._status("所有组件就绪，可以使用了!")
         return True
 
     # ── 录音控制 ──
-    def start_recording(self, on_auto_stop=None):
+    def start_recording(self):
         self._status("正在录音...")
-        self.recorder.start(on_auto_stop=on_auto_stop)
+        self.recorder.start()
 
     def stop_recording(self) -> bytes:
         self._status("录音结束，处理中...")
@@ -78,7 +105,6 @@ class VoiceTypeEngine:
 
     # ── 获取选中文字 ──
     def get_selected_text(self) -> str:
-        """通过 Ctrl+C 获取当前选中的文字"""
         old_clip = ""
         try:
             old_clip = pyperclip.paste()
@@ -99,10 +125,8 @@ class VoiceTypeEngine:
 
     # ── 自动输入到当前窗口 ──
     def type_text(self, text: str):
-        """把文字粘贴到当前活动窗口"""
         if not text.strip():
             return
-        # 清理 markdown 格式符号
         text = text.replace("**", "").replace("__", "")
         pyperclip.copy(text)
         time.sleep(0.05)
@@ -114,7 +138,6 @@ class VoiceTypeEngine:
             self._status("未检测到有效音频")
             return ""
 
-        # 检查任务是否被取消
         if task_id and not self.is_task_valid(task_id):
             return ""
 
@@ -127,7 +150,6 @@ class VoiceTypeEngine:
             self._status("未识别到语音")
             return ""
 
-        # 再次检查取消
         if task_id and not self.is_task_valid(task_id):
             return ""
 
@@ -135,8 +157,12 @@ class VoiceTypeEngine:
 
         # 2. 根据模式处理
         if mode == VoiceMode.TRANSCRIBE:
-            self._status("正在整理文本...")
-            final = self.llm.refine_text(raw_text)
+            # 短文本直接加标点，不走 LLM —— 省 3 秒
+            if len(raw_text) <= self.SHORT_TEXT_THRESHOLD:
+                final = _quick_punctuate(raw_text)
+            else:
+                self._status("正在整理文本...")
+                final = self.llm.refine_text(raw_text)
 
         elif mode == VoiceMode.TRANSLATE:
             target_lang = kwargs.get("target_lang", self.config["translate_target"])
@@ -154,18 +180,15 @@ class VoiceTypeEngine:
         else:
             final = raw_text
 
-        # 最后检查取消
         if task_id and not self.is_task_valid(task_id):
             return ""
 
-        # 清理 markdown 符号
         final = final.strip().replace("**", "").replace("__", "")
         return final
 
     def stop_and_process(self, mode: VoiceMode, task_id: int = 0, **kwargs) -> str:
         audio = self.stop_recording()
 
-        # 检查是否有声音
         if not self.recorder.has_voice():
             self._status("未检测到语音")
             return ""

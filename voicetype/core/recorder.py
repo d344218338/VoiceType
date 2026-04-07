@@ -51,7 +51,7 @@ class AudioRecorder:
                 })
         return devices
 
-    def start(self, on_auto_stop=None):
+    def start(self):
         """开始录音"""
         self._ensure_pyaudio()
         self.frames = []

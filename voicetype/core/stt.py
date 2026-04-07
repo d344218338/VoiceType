@@ -1,9 +1,11 @@
 """语音识别模块 - 多后端支持，优先用最快的"""
 import io
+import wave
+import numpy as np
 
 
 class SpeechToText:
-    """语音转文字 - 自动选择最快的方案"""
+    """语音转文字 - Google API 优先，faster-whisper 离线回退"""
 
     def __init__(self, model_size="base", device="auto", language=None):
         self.language = language or "zh-CN"
@@ -12,35 +14,66 @@ class SpeechToText:
         self._whisper_model = None
 
     def _ensure_model(self):
-        """预加载（仅在需要本地 whisper 时）"""
-        pass  # Google API 不需要预加载
+        pass
 
-    def is_silent(self, audio_bytes: bytes, threshold=400) -> bool:
-        """快速检测音频是否全是静音"""
-        import numpy as np
-        import wave
+    def _trim_silence(self, audio_bytes: bytes, threshold=400) -> bytes:
+        """裁掉音频前后的静音段，减少发送给 STT 的数据量"""
         try:
             buf = io.BytesIO(audio_bytes)
             with wave.open(buf, "rb") as wf:
+                params = wf.getparams()
                 raw = wf.readframes(wf.getnframes())
+
             samples = np.frombuffer(raw, dtype=np.int16)
-            rms = np.sqrt(np.mean(samples.astype(float) ** 2))
-            return rms < threshold
+            if len(samples) == 0:
+                return audio_bytes
+
+            # 用 chunk 级别检测（每 1600 个采样点 = 0.1秒@16kHz）
+            chunk = 1600
+            energies = []
+            for i in range(0, len(samples), chunk):
+                seg = samples[i:i + chunk]
+                energies.append(np.sqrt(np.mean(seg.astype(float) ** 2)))
+
+            # 找到第一个和最后一个有声音的 chunk
+            start_chunk = 0
+            end_chunk = len(energies) - 1
+            for i, e in enumerate(energies):
+                if e > threshold:
+                    start_chunk = max(0, i - 2)  # 保留前 0.2 秒缓冲
+                    break
+
+            for i in range(len(energies) - 1, -1, -1):
+                if energies[i] > threshold:
+                    end_chunk = min(len(energies) - 1, i + 2)  # 保留后 0.2 秒缓冲
+                    break
+
+            # 裁剪
+            start_sample = start_chunk * chunk
+            end_sample = min((end_chunk + 1) * chunk, len(samples))
+
+            if end_sample - start_sample < chunk:
+                return audio_bytes  # 太短不裁
+
+            trimmed = samples[start_sample:end_sample].tobytes()
+
+            out = io.BytesIO()
+            with wave.open(out, "wb") as wf:
+                wf.setparams(params)
+                wf.writeframes(trimmed)
+            return out.getvalue()
         except Exception:
-            return False
+            return audio_bytes
 
     def transcribe(self, audio_bytes: bytes) -> dict:
-        """
-        识别音频，优先用 Google 免费 API（快），失败则回退到本地 Whisper。
-        """
+        """识别音频，优先 Google API，失败回退 Whisper"""
         if not audio_bytes or len(audio_bytes) < 1000:
             return {"text": "", "language": "", "segments": []}
 
-        # 快速静音检测 - 如果音频几乎没声音就立即返回
-        if self.is_silent(audio_bytes):
-            return {"text": "", "language": "", "segments": []}
+        # 裁掉前后静音
+        audio_bytes = self._trim_silence(audio_bytes)
 
-        # 方案1: Google 免费语音识别（最快）
+        # 方案1: Google 免费语音识别
         try:
             text = self._google_recognize(audio_bytes)
             if text:
@@ -48,7 +81,7 @@ class SpeechToText:
         except Exception:
             pass
 
-        # 方案2: 本地 faster-whisper（离线可用）
+        # 方案2: 本地 faster-whisper
         try:
             return self._whisper_recognize(audio_bytes)
         except Exception:
@@ -57,17 +90,14 @@ class SpeechToText:
         return {"text": "", "language": "", "segments": []}
 
     def _google_recognize(self, audio_bytes: bytes) -> str:
-        """Google 免费语音识别 - 无需 API key，速度快"""
+        """Google 免费语音识别"""
         import speech_recognition as sr
 
         recognizer = sr.Recognizer()
-
-        # 直接用内存 BytesIO，不写临时文件
         audio_file = io.BytesIO(audio_bytes)
         with sr.AudioFile(audio_file) as source:
             audio = recognizer.record(source)
 
-        # language 映射
         lang_map = {
             "zh": "zh-CN", "zh-CN": "zh-CN", "zh-TW": "zh-TW",
             "en": "en-US", "ja": "ja-JP", "ko": "ko-KR",
@@ -78,11 +108,10 @@ class SpeechToText:
         if "-" not in lang and len(lang) == 2:
             lang = lang_map.get(lang, f"{lang}-{lang.upper()}")
 
-        text = recognizer.recognize_google(audio, language=lang)
-        return text
+        return recognizer.recognize_google(audio, language=lang)
 
     def _whisper_recognize(self, audio_bytes: bytes) -> dict:
-        """本地 faster-whisper 回退方案"""
+        """本地 faster-whisper 回退"""
         if self._whisper_model is None:
             from faster_whisper import WhisperModel
             device = self.device
@@ -98,10 +127,7 @@ class SpeechToText:
         buf = io.BytesIO(audio_bytes)
         lang = self.language if self.language and len(self.language) == 2 else None
         segments, info = self._whisper_model.transcribe(buf, language=lang, beam_size=5, vad_filter=True)
-
-        texts = []
-        for seg in segments:
-            texts.append(seg.text.strip())
+        texts = [seg.text.strip() for seg in segments]
 
         return {
             "text": " ".join(texts),

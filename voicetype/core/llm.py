@@ -187,7 +187,8 @@ class OllamaLLM:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ]
-        return self.chat(messages, temperature=0.3)
+        max_tok = max(len(text) * 3, 200)
+        return self.chat(messages, temperature=0.3, max_tokens=max_tok)
 
     def ask(self, question: str, context: str = "") -> str:
         """AI 助手问答"""
